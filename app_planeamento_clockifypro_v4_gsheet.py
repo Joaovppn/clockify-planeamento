@@ -131,7 +131,13 @@ def csv_write_records(df: pd.DataFrame) -> pd.DataFrame:
             out[c] = pd.NA
     out = out[["data", "worker", "obra", "horas"]]
     out.to_csv(RECORDS_CSV, index=False)
-    return csv_read_records()
+    # normalizar localmente (sem re-ler do disco se não quisermos)
+    norm = out.copy()
+    norm["date_parsed"] = pd.to_datetime(norm["data"], dayfirst=True, errors="coerce")
+    norm["horas"] = pd.to_numeric(norm["horas"], errors="coerce")
+    norm = norm.dropna(subset=["date_parsed", "worker", "obra", "horas"]).copy()
+    norm["data_display"] = norm["date_parsed"].dt.strftime("%d/%m/%Y")
+    return norm
 
 # ---------- GOOGLE SHEETS BACKEND ----------
 
@@ -217,66 +223,103 @@ def gs_read_records() -> pd.DataFrame:
     return df
 
 def gs_write_records(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Escreve no Google Sheets mas NÃO volta a ler tudo.
+    Normaliza localmente e devolve o df já pronto para usar em memória.
+    """
     ws = gs_get_sheet(RECORDS_SHEET, ["data", "worker", "obra", "horas"])
     out = df.copy()
+
+    # garantir coluna 'data' em dd/mm/aaaa
     if "data_display" in out.columns:
         out["data"] = out["data_display"]
     elif "date_parsed" in out.columns:
         out["data"] = pd.to_datetime(out["date_parsed"]).dt.strftime("%d/%m/%Y")
+
     for c in ["data", "worker", "obra", "horas"]:
         if c not in out.columns:
             out[c] = pd.NA
+
     out = out[["data", "worker", "obra", "horas"]]
+
+    # escrever no Google Sheets (1 escrita)
     ws.clear()
     rows = [out.columns.tolist()] + out.astype(str).fillna("").values.tolist()
     ws.update("A1", rows)
-    return gs_read_records()
+
+    # normalizar em memória, sem voltar a ler do Sheets
+    norm = out.copy()
+    norm["date_parsed"] = pd.to_datetime(norm["data"], dayfirst=True, errors="coerce")
+    norm["horas"] = pd.to_numeric(norm["horas"], errors="coerce")
+    norm = norm.dropna(subset=["date_parsed", "worker", "obra", "horas"]).copy()
+    norm["data_display"] = norm["date_parsed"].dt.strftime("%d/%m/%Y")
+    return norm
 
 # ---------- Dispatcher (CSV ou Sheets) ----------
 
 def init_storage():
+    """
+    Opção B: só lê do backend (CSV ou Sheets) uma vez por sessão.
+    Depois tudo vive em st.session_state, e só escrevemos quando há alterações.
+    """
     if USE_GSHEETS:
         if "gs_client" not in st.session_state:
             st.session_state.gs_client = get_gs_client()
-        # garante que as sheets existem
-        _ = gs_get_sheet(WORKERS_SHEET, ["worker"])
-        _ = gs_get_sheet(OBRAS_SHEET,   ["obra"])
-        _ = gs_get_sheet(RECORDS_SHEET, ["data", "worker", "obra", "horas"])
-        st.session_state.records_df = gs_read_records()
-        st.session_state.workers_df = gs_load_workers()
-        st.session_state.obras_df   = gs_load_obras()
+
+        if "workers_df" not in st.session_state or "obras_df" not in st.session_state or "records_df" not in st.session_state:
+            # garante que as sheets existem
+            _ = gs_get_sheet(WORKERS_SHEET, ["worker"])
+            _ = gs_get_sheet(OBRAS_SHEET,   ["obra"])
+            _ = gs_get_sheet(RECORDS_SHEET, ["data", "worker", "obra", "horas"])
+            st.session_state.workers_df = gs_load_workers()
+            st.session_state.obras_df   = gs_load_obras()
+            st.session_state.records_df = gs_read_records()
+
     else:
         csv_init_storage()
-        st.session_state.records_df = csv_read_records()
-        st.session_state.workers_df = csv_load_workers()
-        st.session_state.obras_df   = csv_load_obras()
+        if "workers_df" not in st.session_state:
+            st.session_state.workers_df = csv_load_workers()
+        if "obras_df" not in st.session_state:
+            st.session_state.obras_df   = csv_load_obras()
+        if "records_df" not in st.session_state:
+            st.session_state.records_df = csv_read_records()
 
 def load_workers() -> pd.DataFrame:
     return st.session_state.workers_df
 
 def save_workers(df: pd.DataFrame):
+    """
+    Grava no backend e ATUALIZA só a cópia em memória.
+    Não volta a ler do Sheets/disk.
+    """
+    df_clean = df.reset_index(drop=True).copy()
     if USE_GSHEETS:
-        gs_save_workers(df)
-        st.session_state.workers_df = gs_load_workers()
+        gs_save_workers(df_clean)
     else:
-        csv_save_workers(df)
-        st.session_state.workers_df = csv_load_workers()
+        csv_save_workers(df_clean)
+    st.session_state.workers_df = df_clean
 
 def load_obras() -> pd.DataFrame:
     return st.session_state.obras_df
 
 def save_obras(df: pd.DataFrame):
+    """
+    Grava no backend e ATUALIZA só a cópia em memória.
+    """
+    df_clean = df.reset_index(drop=True).copy()
     if USE_GSHEETS:
-        gs_save_obras(df)
-        st.session_state.obras_df = gs_load_obras()
+        gs_save_obras(df_clean)
     else:
-        csv_save_obras(df)
-        st.session_state.obras_df = csv_load_obras()
+        csv_save_obras(df_clean)
+    st.session_state.obras_df = df_clean
 
 def read_records() -> pd.DataFrame:
     return st.session_state.records_df
 
 def write_records(df: pd.DataFrame):
+    """
+    Grava os registos no backend e ATUALIZA só a cópia em memória.
+    """
     if USE_GSHEETS:
         st.session_state.records_df = gs_write_records(df)
     else:
@@ -540,7 +583,6 @@ if page == "Adicionar Registos":
                     new_df = pd.concat([read_records(), pd.DataFrame(rows)], ignore_index=True)
                     write_records(new_df)
                     st.success("Registos adicionados com sucesso.")
-                    st.session_state.records_df = read_records()
 
 # === Planeamento Semanal ===
 elif page == "Planeamento Semanal":
